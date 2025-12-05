@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>无限方格系统 - 红石连线与配置版</title>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #121212; font-family: 'Segoe UI', sans-serif; user-select: none; }
+        canvas { display: block; cursor: crosshair; }
+
+        /* 悬浮菜单 */
+        #context-menu {
+            position: absolute; display: none; background: #2d2d2d; border: 1px solid #444;
+            border-radius: 6px; box-shadow: 0 4px 15px rgba(0,0,0,0.6);
+            padding: 8px; z-index: 100; min-width: 180px; color: #eee;
+        }
+        .menu-header { font-size: 12px; color: #aaa; margin-bottom: 8px; padding-bottom: 4px; border-bottom: 1px solid #444; }
+        .menu-btn {
+            display: block; width: 100%; text-align: left; padding: 8px 12px;
+            background: transparent; border: none; color: #ddd; cursor: pointer;
+            border-radius: 4px; font-size: 14px; transition: background 0.2s;
+        }
+        .menu-btn:hover { background-color: #3d3d3d; }
+        .menu-btn.danger { color: #ff6b6b; }
+        .menu-btn.danger:hover { background-color: #3d2020; }
+
+        /* 配置表单区域 */
+        .config-section { margin-top: 5px; padding-top: 5px; border-top: 1px dashed #444; }
+        .form-group { margin-bottom: 8px; }
+        .form-group label { display: block; font-size: 11px; color: #888; margin-bottom: 2px; }
+        .form-group input, .form-group select {
+            width: 90%; padding: 4px; background: #1a1a1a; border: 1px solid #444; color: white; border-radius: 3px;
+        }
+
+        /* 提示UI */
+        #ui-hint {
+            position: absolute; top: 10px; left: 10px; pointer-events: none;
+            color: rgba(255,255,255,0.5); font-size: 12px; background: rgba(0,0,0,0.3); padding: 5px; border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui-hint">
+    左键点击: 打开菜单/配置 | 长按(0.5s): 拖拽移动方格 | 滚轮: 缩放 | 拖拽空白: 移动视角
+</div>
+
+<div id="context-menu">
+    <!-- 动态内容 -->
+</div>
+
+<canvas id="gridCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gridCanvas');
+    const ctx = canvas.getContext('2d');
+    const menu = document.getElementById('context-menu');
+
+    // --- 核心状态 ---
+    const config = {
+        bgColor: '#121212',
+        gridColor: '#2a2a2a',
+        lineColor: '#00bcd4',
+        deviceColor: '#4caf50',
+        longPressDelay: 500 // 长按触发毫秒数
+    };
+
+    let view = { x: 0, y: 0, scale: 1, cellSize: 60 };
+    
+    // 数据存储 map<"x,y", {type, props}>
+    const gridData = new Map();
+
+    // 交互状态机
+    let interaction = {
+        isDraggingView: false,
+        isDraggingCell: false,
+        draggedCellKey: null, // 被拖拽的原始坐标key
+        draggedCellData: null, // 被拖拽的数据备份
+        dragCurrentGrid: null, // 当前拖拽到的网格坐标 {x, y}
+        
+        lastMouse: { x: 0, y: 0 },
+        startMouse: { x: 0, y: 0 },
+        startTime: 0,
+        longPressTimer: null,
+        
+        menuOpen: false,
+        menuGrid: null // 菜单打开时的网格坐标
+    };
+
+    // 初始化一些演示数据
+    gridData.set("0,0", { type: 'device', props: { name: "主控机", io: 'out' } });
+    gridData.set("1,0", { type: 'line', props: { speed: 1 } });
+    gridData.set("2,0", { type: 'line', props: { speed: 1 } });
+    gridData.set("2,1", { type: 'line', props: { speed: 1 } });
+    gridData.set("2,2", { type: 'device', props: { name: "接收器", io: 'in' } });
+
+    // --- 辅助函数 ---
+    const getKey = (x, y) => `${x},${y}`;
+    const parseKey = (key) => key.split(',').map(Number);
+    const screenToWorld = (sx, sy) => ({
+        x: (sx - view.x) / view.scale,
+        y: (sy - view.y) / view.scale
+    });
+    const worldToGrid = (wx, wy) => ({
+        x: Math.floor(wx / view.cellSize),
+        y: Math.floor(wy / view.cellSize)
+    });
+
+    // --- 渲染系统 ---
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        draw();
+    }
+    window.addEventListener('resize', resize);
+
+    function draw() {
+        // 清除背景
+        ctx.fillStyle = config.bgColor;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.save();
+        ctx.translate(view.x, view.y);
+        ctx.scale(view.scale, view.scale);
+
+        // 1. 绘制网格线 (优化性能：只画可视区域)
+        drawGridLines();
+
+        // 2. 绘制方格内容
+        const now = Date.now();
+        
+        // 渲染静态存在的方格
+        for (const [key, cell] of gridData) {
+            // 如果正在拖拽这个格子，暂时不画在原位
+            if (interaction.isDraggingCell && interaction.draggedCellKey === key) continue;
+
+            const [gx, gy] = parseKey(key);
+            drawCell(gx, gy, cell, now);
+        }
+
+        // 3. 渲染正在拖拽的方格 (Ghost)
+        if (interaction.isDraggingCell && interaction.draggedCellData) {
+            const { x, y } = interaction.dragCurrentGrid;
+            ctx.globalAlpha = 0.6;
+            drawCell(x, y, interaction.draggedCellData, now);
+            ctx.globalAlpha = 1.0;
+            
+            // 绘制拖拽边框提示
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x * view.cellSize, y * view.cellSize, view.cellSize, view.cellSize);
+        }
+
+        ctx.restore();
+        requestAnimationFrame(draw);
+    }
+
+    function drawGridLines() {
+        const cs = view.cellSize;
+        const startCol = Math.floor(-view.x / view.scale / cs);
+        const endCol = Math.floor((canvas.width - view.x) / view.scale / cs) + 1;
+        const startRow = Math.floor(-view.y / view.scale / cs);
+        const endRow = Math.floor((canvas.height - view.y) / view.scale / cs) + 1;
+
+        ctx.strokeStyle = config.gridColor;
+        ctx.lineWidth = 1; // 保持细线
+        ctx.beginPath();
+        for (let c = startCol; c <= endCol; c++) {
+            ctx.moveTo(c * cs, startRow * cs);
+            ctx.lineTo(c * cs, endRow * cs);
+        }
+        for (let r = startRow; r <= endRow; r++) {
+            ctx.moveTo(startCol * cs, r * cs);
+            ctx.lineTo(endCol * cs, r * cs);
+        }
+        ctx.stroke();
+    }
+
+    function drawCell(gx, gy, cell, time) {
+        const x = gx * view.cellSize;
+        const y = gy * view.cellSize;
+        const cs = view.cellSize;
+        const cx = x + cs / 2;
+        const cy = y + cs / 2;
+
+        if (cell.type === 'device') {
+            // 绘制设备
+            ctx.fillStyle = config.deviceColor;
+            ctx.fillRect(x + 4, y + 4, cs - 8, cs - 8);
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x + 4, y + 4, cs - 8, cs - 8);
+            
+            // 绘制文字
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 10px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(cell.props.name || 'DEV', cx, cy);
+            
+            // IO 标识
+            ctx.fillStyle = '#rgba(255,255,255,0.7)';
+            ctx.font = '8px Arial';
+            ctx.fillText(cell.props.io === 'in' ? 'IN' : 'OUT', cx, cy + 15);
+
+        } else if (cell.type === 'line') {
+            // 红石连线逻辑
+            drawRedstoneLine(gx, gy, x, y, cs, cell, time);
+        }
+    }
+
+    // 类似红石的自动连线渲染
+    function drawRedstoneLine(gx, gy, x, y, size, cell, time) {
+        const cx = x + size / 2;
+        const cy = y + size / 2;
+        const speed = cell.props.speed || 1;
+
+        // 检查四周是否有连接物 (线或设备)
+        const neighbors = {
+            top: hasConnectable(gx, gy - 1),
+            right: hasConnectable(gx + 1, gy),
+            bottom: hasConnectable(gx, gy + 1),
+            left: hasConnectable(gx - 1, gy)
+        };
+
+        ctx.strokeStyle = config.lineColor;
+        ctx.lineWidth = 6;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+
+        // 如果孤立，画一个中心点
+        if (!neighbors.top && !neighbors.right && !neighbors.bottom && !neighbors.left) {
+            ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+        } else {
+            // 绘制中心到各个方向的线
+            if (neighbors.top || neighbors.bottom) {
+                ctx.moveTo(cx, neighbors.top ? y : cy);
+                ctx.lineTo(cx, neighbors.bottom ? y + size : cy);
+            }
+            if (neighbors.left || neighbors.right) {
+                ctx.moveTo(neighbors.left ? x : cx, cy);
+                ctx.lineTo(neighbors.right ? x + size : cx, cy);
+            }
+            // 处理拐角情况需要补全中心点
+            if ((neighbors.top || neighbors.bottom) && (neighbors.left || neighbors.right)) {
+               // 线条交叉已经覆盖，不需要额外处理，除非想做圆角
+            }
+        }
+        ctx.stroke();
+
+        // 动画：粒子流动效果
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 15]);
+        // 根据时间偏移虚线
+        ctx.lineDashOffset = -(time / 20 * speed); 
+        ctx.beginPath();
+        
+        // 重复路径绘制一次虚线
+        if (neighbors.top || neighbors.bottom) {
+            ctx.moveTo(cx, neighbors.top ? y : cy);
+            ctx.lineTo(cx, neighbors.bottom ? y + size : cy);
+        }
+        if (neighbors.left || neighbors.right) {
+            ctx.moveTo(neighbors.left ? x : cx, cy);
+            ctx.lineTo(neighbors.right ? x + size : cx, cy);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]); // 重置
+    }
+
+    function hasConnectable(gx, gy) {
+        const cell = gridData.get(getKey(gx, gy));
+        // 假设所有线和设备都可以互连
+        return cell && (cell.type === 'line' || cell.type === 'device');
+    }
+
+    // --- 交互系统 ---
+
+    canvas.addEventListener('mousedown', e => {
+        if (e.button !== 0) return; // 只处理左键
+
+        const mouseX = e.clientX;
+        const mouseY = e.clientY;
+        const world = screenToWorld(mouseX, mouseY);
+        const grid = worldToGrid(world.x, world.y);
+        const key = getKey(grid.x, grid.y);
+        const cell = gridData.get(key);
+
+        interaction.startMouse = { x: mouseX, y: mouseY };
+        interaction.lastMouse = { x: mouseX, y: mouseY };
+        interaction.startTime = Date.now();
+        interaction.dragCurrentGrid = grid;
+
+        // 如果菜单打开，且点击位置不在菜单内(菜单是DOM，Canvas在下)，逻辑处理交由 mouseup 判断
+        // 但这里需要标记，防止立刻触发其他逻辑
+        if (interaction.menuOpen) {
+            return; 
+        }
+
+        // 设置长按检测 (仅针对存在的方格)
+        if (cell) {
+            interaction.longPressTimer = setTimeout(() => {
+                // 触发长按拖拽模式
+                interaction.isDraggingCell = true;
+                interaction.draggedCellKey = key;
+                interaction.draggedCellData = { ...cell }; // 浅拷贝
+                canvas.style.cursor = 'grabbing';
+                closeMenu(); // 拖拽时关闭菜单
+            }, config.longPressDelay);
+        }
+    });
+
+    canvas.addEventListener('mousemove', e => {
+        const dx = e.clientX - interaction.lastMouse.x;
+        const dy = e.clientY - interaction.lastMouse.y;
+        interaction.lastMouse = { x: e.clientX, y: e.clientY };
+
+        // 计算总移动距离，用于判断是否是点击
+        const moveDist = Math.hypot(e.clientX - interaction.startMouse.x, e.clientY - interaction.startMouse.y);
+
+        // 如果移动超过阈值，取消长按计时器
+        if (moveDist > 5 && interaction.longPressTimer) {
+            clearTimeout(interaction.longPressTimer);
+            interaction.longPressTimer = null;
+        }
+
+        if (interaction.isDraggingCell) {
+            // 模式1：拖拽方格
+            const world = screenToWorld(e.clientX, e.clientY);
+            interaction.dragCurrentGrid = worldToGrid(world.x, world.y);
+        } else if (e.buttons === 1) { 
+            // 模式2：拖拽视角 (只有在未触发长按且确实在移动时)
+            if (!interaction.menuOpen) { // 菜单打开时不拖动视角
+                view.x += dx;
+                view.y += dy;
+                interaction.isDraggingView = true;
+            }
+        }
+    });
+
+    canvas.addEventListener('mouseup', e => {
+        clearTimeout(interaction.longPressTimer);
+        const world = screenToWorld(e.clientX, e.clientY);
+        const grid = worldToGrid(world.x, world.y);
+
+        // 1. 处理方格拖拽结束
+        if (interaction.isDraggingCell) {
+            finishCellDrag(grid);
+            interaction.isDraggingCell = false;
+            interaction.draggedCellKey = null;
+            interaction.draggedCellData = null;
+            canvas.style.cursor = 'crosshair';
+            return;
+        }
+
+        // 2. 处理点击逻辑 (未拖拽视图且移动距离很小)
+        const moveDist = Math.hypot(e.clientX - interaction.startMouse.x, e.clientY - interaction.startMouse.y);
+        if (moveDist < 5) {
+            handleCleanClick(e.clientX, e.clientY, grid);
+        }
+
+        interaction.isDraggingView = false;
+    });
+
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const zoom = e.deltaY < 0 ? 1.1 : 0.9;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const wx = (mx - view.x) / view.scale;
+        const wy = (my - view.y) / view.scale;
+
+        view.scale *= zoom;
+        view.scale = Math.max(0.2, Math.min(view.scale, 5));
+        view.x = mx - wx * view.scale;
+        view.y = my - wy * view.scale;
+        
+        closeMenu(); // 缩放关闭菜单
+    });
+
+    // --- 逻辑处理 ---
+
+    function finishCellDrag(targetGrid) {
+        const oldKey = interaction.draggedCellKey;
+        const newKey = getKey(targetGrid.x, targetGrid.y);
+        
+        if (oldKey === newKey) return; // 原地不动
+
+        const movingCell = interaction.draggedCellData;
+        const targetCell = gridData.get(newKey);
+
+        // 删除旧位置
+        gridData.delete(oldKey);
+
+        // 如果新位置有东西，交换回去 (或者覆盖? 这里实现为交换，更人性化)
+        if (targetCell) {
+            gridData.set(oldKey, targetCell);
+        }
+
+        // 放置新位置
+        gridData.set(newKey, movingCell);
+    }
+
+    function handleCleanClick(sx, sy, grid) {
+        // 核心需求：如果菜单已经被打开时，点击其他位置是先取消菜单
+        if (interaction.menuOpen) {
+            closeMenu();
+            return; 
+        }
+
+        // 打开新菜单
+        openMenu(sx, sy, grid);
+    }
+
+    function openMenu(sx, sy, grid) {
+        interaction.menuOpen = true;
+        interaction.menuGrid = grid;
+        
+        const key = getKey(grid.x, grid.y);
+        const cell = gridData.get(key);
+
+        menu.style.display = 'block';
+        menu.style.left = Math.min(sx, window.innerWidth - 200) + 'px';
+        menu.style.top = Math.min(sy, window.innerHeight - 300) + 'px';
+
+        renderMenuContent(cell);
+    }
+
+    function closeMenu() {
+        interaction.menuOpen = false;
+        menu.style.display = 'none';
+        // 保存配置等操作通常是即时的，不需要额外动作
+    }
+
+    function renderMenuContent(cell) {
+        let html = `<div class="menu-header">位置: ${interaction.menuGrid.x}, ${interaction.menuGrid.y}</div>`;
+
+        if (!cell) {
+            // 空方格：显示添加选项
+            html += `
+                <button class="menu-btn" onclick="addCell('line')">放置 线缆 (Line)</button>
+                <button class="menu-btn" onclick="addCell('device')">放置 设备 (Device)</button>
+            `;
+        } else {
+            // 已有方格：显示属性配置和删除
+            if (cell.type === 'device') {
+                html += `
+                    <div class="menu-header">设备配置</div>
+                    <div class="config-section">
+                        <div class="form-group">
+                            <label>名称</label>
+                            <input type="text" value="${cell.props.name || ''}" oninput="updateProp('name', this.value)">
+                        </div>
+                        <div class="form-group">
+                            <label>I/O 模式</label>
+                            <select onchange="updateProp('io', this.value)">
+                                <option value="in" ${cell.props.io === 'in'?'selected':''}>输入 (Input)</option>
+                                <option value="out" ${cell.props.io === 'out'?'selected':''}>输出 (Output)</option>
+                            </select>
+                        </div>
+                    </div>
+                `;
+            } else if (cell.type === 'line') {
+                html += `
+                    <div class="menu-header">线缆配置</div>
+                    <div class="config-section">
+                        <div class="form-group">
+                            <label>传输速度</label>
+                            <input type="range" min="0" max="5" step="0.5" value="${cell.props.speed || 1}" oninput="updateProp('speed', Number(this.value))">
+                        </div>
+                    </div>
+                `;
+            }
+
+            html += `<div style="height:10px"></div>`;
+            html += `<button class="menu-btn danger" onclick="deleteCell()">删除 (Delete)</button>`;
+        }
+        
+        menu.innerHTML = html;
+    }
+
+    // --- 菜单调用的全局函数 ---
+    
+    window.addCell = function(type) {
+        const {x, y} = interaction.menuGrid;
+        const key = getKey(x, y);
+        
+        let props = {};
+        if (type === 'device') props = { name: `DEV-${Math.floor(Math.random()*100)}`, io: 'in' };
+        if (type === 'line') props = { speed: 1 };
+
+        gridData.set(key, { type, props });
+        closeMenu(); // 添加后关闭菜单
+    };
+
+    window.deleteCell = function() {
+        const {x, y} = interaction.menuGrid;
+        gridData.delete(getKey(x, y));
+        closeMenu();
+    };
+
+    window.updateProp = function(propKey, value) {
+        const {x, y} = interaction.menuGrid;
+        const cell = gridData.get(getKey(x, y));
+        if (cell) {
+            cell.props[propKey] = value;
+        }
+    };
+
+    // 启动
+    resize();
+    requestAnimationFrame(draw);
+
+</script>
+</body>
+</html>
